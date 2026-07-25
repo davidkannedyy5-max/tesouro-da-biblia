@@ -2497,8 +2497,13 @@ function _schedulePurgedEventsSave(wrapper){
 // evento), porque o Bin inteiro passava do limite a cada tentativa de gravação.
 // Solução: as trilhas cronológicas agora vivem em um Bin próprio, criado automaticamente na
 // primeira vez que for preciso, e só elas competem pelo limite desse Bin — sem disputar espaço
-// com usuários e eventos. Dados antigos (já salvos dentro do Bin principal) são migrados
-// automaticamente para o Bin novo na primeira leitura após esta atualização.
+// com usuários e eventos.
+// IMPORTANTE: o ID desse Bin novo é guardado DENTRO do Bin principal (campo `ctBinId`, poucos
+// bytes) — não só no localStorage do aparelho. O app é aberto como arquivo local (content://),
+// e esse tipo de origem pode não manter localStorage entre uma abertura e outra, então guardar
+// o ponteiro só localmente faz ele "sumir" pro app na próxima sessão mesmo ele existindo no
+// JSONBin. Guardando no Bin principal (compartilhado na nuvem), qualquer sessão/aparelho acha
+// o Bin dedicado sempre. localStorage ainda é usado como cache rápido, nunca como única fonte.
 var CT_BIN_ID_KEY='biblia-ct-binid-v1';
 function getCTBinId(){try{return localStorage.getItem(CT_BIN_ID_KEY)||null;}catch(e){return null;}}
 function setCTBinId(id){try{localStorage.setItem(CT_BIN_ID_KEY,id);}catch(e){}}
@@ -2538,33 +2543,72 @@ async function ctWriteBin(cfg,id,data){
     return false;
   }catch(e){console.error('[ctWriteBin] Falha de rede ao gravar Bin dedicado:',e);return false;}
 }
+// Rede de segurança: procura, entre os Bins da conta, um Bin órfão que já tenha sido criado
+// para as trilhas cronológicas (ex.: de uma sessão anterior cujo ponteiro não chegou a ser
+// salvo de volta no Bin principal). Só entra em ação quando não há nenhum ponteiro conhecido
+// E o Bin principal já está sem trilhas — evita recriar Bins novos à toa.
+async function _ctRecoverLostBin(cfg){
+  try{
+    var r=await fetch('https://api.jsonbin.io/v3/c/uncategorized/bins',{headers:{'X-Master-Key':cfg.secret}});
+    if(!r.ok){console.error('[_ctRecoverLostBin] JSONBin respondeu status '+r.status);return null;}
+    var list=await r.json();
+    if(!Array.isArray(list))return null;
+    for(var i=0;i<list.length&&i<25;i++){
+      var id=list[i]&&list[i].record;
+      if(!id||id===cfg.url)continue;
+      var data=await ctReadBin(cfg,id);
+      if(data&&Array.isArray(data.chronoTrilhas)&&data.chronoTrilhas.length>0)return id;
+    }
+  }catch(e){console.error('[_ctRecoverLostBin] Falha ao tentar recuperar Bin perdido:',e);}
+  return null;
+}
 var _ctCache=null;
+var _ctCacheId=null;
 var _ctMigrating=false;
 // Chamado sempre que lEv() monta o objeto de eventos: sobrescreve wrapper.chronoTrilhas com o
-// conteúdo do Bin dedicado (se já existir) ou migra dados antigos pra lá (primeira vez).
+// conteúdo do Bin dedicado (se já existir), migra dados antigos pra lá (primeira vez) ou tenta
+// recuperar automaticamente um Bin dedicado que já exista mas cujo ponteiro se perdeu.
 async function _ctLoadAndMerge(wrapper){
   var cfg=getFBCfg();
   if(!cfg||!cfg.url||!cfg.secret)return; // sem sync configurado — mantém como está (só local)
-  var ctId=getCTBinId();
+  var ctId=wrapper.ctBinId||getCTBinId();
   if(ctId){
-    if(!_ctCache)_ctCache=await ctReadBin(cfg,ctId);
+    setCTBinId(ctId);
+    if(!_ctCache||_ctCacheId!==ctId){_ctCache=await ctReadBin(cfg,ctId);_ctCacheId=ctId;}
     if(_ctCache&&Array.isArray(_ctCache.chronoTrilhas))wrapper.chronoTrilhas=_ctCache.chronoTrilhas;
+    if(wrapper.ctBinId!==ctId){
+      wrapper.ctBinId=ctId; // garante que o ponteiro fique gravado no Bin principal também
+      sEv(wrapper).catch(function(e){console.error('[_ctLoadAndMerge] Falha ao salvar ponteiro do Bin dedicado:',e);});
+    }
     return;
   }
   if(_ctMigrating)return;
-  if(Array.isArray(wrapper.chronoTrilhas)&&wrapper.chronoTrilhas.length>0){
-    _ctMigrating=true;
-    try{
+  _ctMigrating=true;
+  try{
+    if(Array.isArray(wrapper.chronoTrilhas)&&wrapper.chronoTrilhas.length>0){
+      // Dados legados ainda dentro do Bin principal — migra pra um Bin próprio.
       var newId=await ctCreateBin(cfg,{chronoTrilhas:wrapper.chronoTrilhas});
       if(newId){
-        setCTBinId(newId);
-        _ctCache={chronoTrilhas:wrapper.chronoTrilhas};
-        // Salva em segundo plano pra já tirar as trilhas de dentro do Bin principal e encolhê-lo.
+        wrapper.ctBinId=newId;setCTBinId(newId);_ctCache={chronoTrilhas:wrapper.chronoTrilhas};_ctCacheId=newId;
         sEv(wrapper).catch(function(e){console.error('[_ctLoadAndMerge] Falha ao encolher o Bin principal após migrar trilhas:',e);});
       }
-    }catch(e){console.error('[_ctLoadAndMerge] Falha na migração automática das trilhas cronológicas:',e);}
-    _ctMigrating=false;
-  }
+    }else{
+      // Bin principal sem trilhas E sem ponteiro: provavelmente uma sessão anterior já migrou
+      // os dados, mas o ponteiro só ficou salvo no localStorage daquele aparelho/sessão (que
+      // pode não persistir ao reabrir o arquivo local). Tenta recuperar automaticamente.
+      var recoveredId=await _ctRecoverLostBin(cfg);
+      if(recoveredId){
+        var recovered=await ctReadBin(cfg,recoveredId);
+        if(recovered&&Array.isArray(recovered.chronoTrilhas)){
+          wrapper.chronoTrilhas=recovered.chronoTrilhas;
+          wrapper.ctBinId=recoveredId;
+          setCTBinId(recoveredId);_ctCache=recovered;_ctCacheId=recoveredId;
+          sEv(wrapper).catch(function(e){console.error('[_ctLoadAndMerge] Falha ao salvar ponteiro do Bin recuperado:',e);});
+        }
+      }
+    }
+  }catch(e){console.error('[_ctLoadAndMerge] Falha na migração/recuperação automática das trilhas cronológicas:',e);}
+  _ctMigrating=false;
 }
 function _regEv(wrapper){
   regCustomRewardItems(wrapper.events);
@@ -2573,7 +2617,7 @@ function _regEv(wrapper){
 async function lEv(){
   var b=await jbGetBin();
   if(b&&Array.isArray(b.events)){
-    _cache[EV_KEY]={events:b.events,customRewards:Array.isArray(b.customRewards)?b.customRewards:[],trilhaImages:(b.trilhaImages&&typeof b.trilhaImages==='object')?b.trilhaImages:{},chronoTrilhas:Array.isArray(b.chronoTrilhas)?b.chronoTrilhas:[],eventTrophyImages:(b.eventTrophyImages&&typeof b.eventTrophyImages==='object')?b.eventTrophyImages:{}};
+    _cache[EV_KEY]={events:b.events,customRewards:Array.isArray(b.customRewards)?b.customRewards:[],trilhaImages:(b.trilhaImages&&typeof b.trilhaImages==='object')?b.trilhaImages:{},chronoTrilhas:Array.isArray(b.chronoTrilhas)?b.chronoTrilhas:[],eventTrophyImages:(b.eventTrophyImages&&typeof b.eventTrophyImages==='object')?b.eventTrophyImages:{},ctBinId:b.ctBinId||null};
     if(_purgeExpiredEvents(_cache[EV_KEY]))_schedulePurgedEventsSave(_cache[EV_KEY]);
     _regEv(_cache[EV_KEY]);
     await _ctLoadAndMerge(_cache[EV_KEY]);
@@ -2582,6 +2626,7 @@ async function lEv(){
   if(_cache[EV_KEY]){
     if(!Array.isArray(_cache[EV_KEY].chronoTrilhas))_cache[EV_KEY].chronoTrilhas=[];
     if(!_cache[EV_KEY].eventTrophyImages||typeof _cache[EV_KEY].eventTrophyImages!=='object')_cache[EV_KEY].eventTrophyImages={};
+    if(_cache[EV_KEY].ctBinId===undefined)_cache[EV_KEY].ctBinId=null;
     if(_purgeExpiredEvents(_cache[EV_KEY]))_schedulePurgedEventsSave(_cache[EV_KEY]);
     _regEv(_cache[EV_KEY]);
     await _ctLoadAndMerge(_cache[EV_KEY]);
@@ -2593,6 +2638,7 @@ async function lEv(){
   if(!_cache[EV_KEY].trilhaImages||typeof _cache[EV_KEY].trilhaImages!=='object')_cache[EV_KEY].trilhaImages={};
   if(!Array.isArray(_cache[EV_KEY].chronoTrilhas))_cache[EV_KEY].chronoTrilhas=[];
   if(!_cache[EV_KEY].eventTrophyImages||typeof _cache[EV_KEY].eventTrophyImages!=='object')_cache[EV_KEY].eventTrophyImages={};
+  if(_cache[EV_KEY].ctBinId===undefined)_cache[EV_KEY].ctBinId=null;
   if(_purgeExpiredEvents(_cache[EV_KEY]))_schedulePurgedEventsSave(_cache[EV_KEY]);
   _regEv(_cache[EV_KEY]);
   await _ctLoadAndMerge(_cache[EV_KEY]);
@@ -2604,12 +2650,12 @@ async function sEv(d){
   var ctOk=true;
   if(cfg&&cfg.url&&cfg.secret&&Array.isArray(d.chronoTrilhas)){
     try{
-      var ctId=getCTBinId();
+      var ctId=d.ctBinId||getCTBinId();
       if(!ctId)ctId=await ctCreateBin(cfg,{chronoTrilhas:d.chronoTrilhas});
       if(ctId){
-        setCTBinId(ctId);
+        d.ctBinId=ctId;setCTBinId(ctId);
         ctOk=await ctWriteBin(cfg,ctId,{chronoTrilhas:d.chronoTrilhas});
-        if(ctOk)_ctCache={chronoTrilhas:d.chronoTrilhas};
+        if(ctOk){_ctCache={chronoTrilhas:d.chronoTrilhas};_ctCacheId=ctId;}
       }else{
         ctOk=false;
       }
@@ -2629,6 +2675,9 @@ async function sEv(d){
     // As trilhas cronológicas NÃO entram mais no Bin principal (ver Bin dedicado acima). Se
     // ainda sobrar um array legado aqui (de antes desta correção), remove pra liberar espaço.
     if('chronoTrilhas' in b)delete b.chronoTrilhas;
+    // Ponteiro pro Bin dedicado — pequeno (só um ID), fica salvo aqui pra qualquer
+    // aparelho/sessão achar o Bin das trilhas, mesmo sem depender do localStorage local.
+    if(d.ctBinId)b.ctBinId=d.ctBinId;
     if(d.eventTrophyImages&&typeof d.eventTrophyImages==='object')b.eventTrophyImages=d.eventTrophyImages;
     // Atualiza a memória IMEDIATAMENTE e de forma síncrona (antes de qualquer espera de rede).
     // Isso é essencial: se outra função concorrente (como sU, que salva o progresso do jogador
@@ -2666,6 +2715,7 @@ async function sTrilhaImgs(imgs){
   d.trilhaImages=imgs;
   return await sEv(d);
 }
+
 
 
 function adminFillFromPastedJSON(){
